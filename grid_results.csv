@@ -1,0 +1,1 @@
+num_rnn_layers,num_neurons_in_rnn_layer,is_bidirectional,use_gru,dropout,precision,recall,f1,roc_auc
