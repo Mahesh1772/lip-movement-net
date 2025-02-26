@@ -1,3 +1,4 @@
 *.mpg
 *.jpg
 /venv
+*.mp4
