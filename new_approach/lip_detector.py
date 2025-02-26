@@ -3,13 +3,24 @@ import mediapipe as mp
 import numpy as np
 from collections import defaultdict, deque
 import time
+import tensorflow as tf  # Add TensorFlow import
 
 class LipDetector:
     def __init__(self):
-        # Initialize MediaPipe Face Mesh
+        # Enable GPU growth to prevent TF from taking all memory
+        physical_devices = tf.config.list_physical_devices('GPU')
+        if physical_devices:
+            try:
+                for gpu in physical_devices:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                print("GPU acceleration enabled!")
+            except RuntimeError as e:
+                print(f"GPU setup error: {e}")
+        
+        # Initialize MediaPipe Face Mesh with GPU
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=5,  # Increased max faces
+            max_num_faces=5,
             refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
