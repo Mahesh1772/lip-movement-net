@@ -67,16 +67,10 @@ def process_video(input_path, output_path):
         if frame_count % 30 == 0:  # Update every 30 frames
             progress = (frame_count / total_frames) * 100
             print(f"Progress: {progress:.1f}%", end='\r')
-        
-        # Optional: Display frame while processing
-        cv2.imshow('Processing', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
     
     # Cleanup
     cap.release()
     out.release()
-    cv2.destroyAllWindows()
     
     print(f"\nProcessing complete! Output saved to: {output_path}")
 
