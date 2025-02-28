@@ -17,19 +17,23 @@ class LipDetector:
             except RuntimeError as e:
                 print(f"GPU setup error: {e}")
         
-        # Initialize MediaPipe Face Mesh with GPU
+        # Initialize MediaPipe Face Mesh with lower thresholds
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=5,
+            max_num_faces=10,          # Keep max faces at 4
             refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.5,  # Lower threshold for detection
+            min_tracking_confidence=0.5    # Lower threshold for tracking
         )
         
-        # Parameters for speaking detection
-        self.SILENCE_THRESHOLD = 0.038    # Normalized lip distance threshold
-        self.MOVEMENT_THRESHOLD = 0.004   # Minimum change to consider movement
-        self.SILENCE_DURATION = 1.0       # Seconds of closed lips to consider silent
+        # Adjust speaking detection parameters
+        self.SILENCE_THRESHOLD = 0.035    # Lower - easier to detect open mouth
+        self.MOVEMENT_THRESHOLD = 0.004   # Lower - more sensitive to movement
+        self.SILENCE_DURATION = 0.5       # Keep quick transition to silence
+        
+        # Define lip landmarks
+        self.UPPER_LIP_INDICES = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409]
+        self.LOWER_LIP_INDICES = [146, 91, 181, 84, 17, 314, 405, 321, 375, 291]
         
         # Track multiple faces
         self.face_histories = defaultdict(lambda: {
@@ -47,35 +51,29 @@ class LipDetector:
             return []
             
         face_data = []
+        h, w = image.shape[:2]
+        
         for face_idx, face_landmarks in enumerate(results.multi_face_landmarks):
-            # Get lip landmarks
-            upper_lip = np.array([face_landmarks.landmark[13].y, 
-                                face_landmarks.landmark[14].y])
-            lower_lip = np.array([face_landmarks.landmark[17].y,
-                                face_landmarks.landmark[16].y])
-            
             # Calculate normalized height
-            lip_height = np.mean(np.abs(upper_lip - lower_lip))
-            face_height = abs(face_landmarks.landmark[152].y - face_landmarks.landmark[10].y)
-            normalized_height = lip_height / face_height
+            lip_height = self.calculate_lip_height(face_landmarks)
             
             face_data.append({
                 'id': face_idx,
-                'height': normalized_height,
+                'height': lip_height,
                 'landmarks': face_landmarks
             })
-            
+        
         return face_data
         
     def detect_speaking(self, frame):
         faces_data = self.get_lip_heights(frame)
         current_time = time.time()
         
-        # Remove old faces that haven't been seen recently
+        # Remove old faces
         active_faces = set(face['id'] for face in faces_data)
         for face_id in list(self.face_histories.keys()):
             if face_id not in active_faces:
-                if current_time - self.face_histories[face_id]['last_speaking_time'] > 5.0:
+                if current_time - self.face_histories[face_id]['last_speaking_time'] > 2.0:  # Reduced timeout
                     del self.face_histories[face_id]
         
         # Process each detected face
@@ -84,25 +82,25 @@ class LipDetector:
             lip_height = face_data['height']
             face_history = self.face_histories[face_id]
             
-            # Update histories
-            face_history['distance_history'].append(lip_height)
+            # Require more consistent movement for speaking detection
             face_history['last_heights'].append(lip_height)
-            
-            # Detect movement
-            if len(face_history['last_heights']) >= 3:
-                variation = np.std(list(face_history['last_heights'])[-3:])
-                height_change = variation > self.MOVEMENT_THRESHOLD
+            if len(face_history['last_heights']) >= 5:  # Increased window size
+                recent_heights = list(face_history['last_heights'])[-5:]
+                variation = np.std(recent_heights)
                 
-                # Update speaking status
-                if height_change and lip_height > self.SILENCE_THRESHOLD:
+                # More strict speaking detection
+                is_moving = variation > self.MOVEMENT_THRESHOLD
+                is_open = lip_height > self.SILENCE_THRESHOLD
+                
+                if is_moving and is_open:
                     face_history['last_speaking_time'] = current_time
                     face_history['is_speaking'] = True
                 elif current_time - face_history['last_speaking_time'] > self.SILENCE_DURATION:
                     face_history['is_speaking'] = False
             
-            # Draw debug for this face
+            # Draw debug visualization
             frame = self.draw_debug(frame, face_data['landmarks'], 
-                                  lip_height, face_history['is_speaking'], face_id)
+                                 lip_height, face_history['is_speaking'], face_id)
         
         return frame, {face_id: data['is_speaking'] 
                       for face_id, data in self.face_histories.items()}
@@ -110,23 +108,38 @@ class LipDetector:
     def draw_debug(self, frame, landmarks, height, is_speaking, face_id):
         h, w, _ = frame.shape
         
-        # Calculate text position based on face position
+        # Draw ALL lip landmarks more visibly
+        for idx in self.UPPER_LIP_INDICES + self.LOWER_LIP_INDICES:
+            pos = landmarks.landmark[idx]
+            x, y = int(pos.x * w), int(pos.y * h)
+            # Draw larger circles in bright color
+            cv2.circle(frame, (x, y), 3, (0, 255, 255), -1)  # Yellow dots
+            
+        # Calculate text position based on nose position
         nose_tip = landmarks.landmark[4]
         text_x = int(nose_tip.x * w)
         text_y = int(nose_tip.y * h) - 20
         
-        # Draw lip landmarks
-        for idx in [13, 14, 17, 16]:
-            pos = landmarks.landmark[idx]
-            cv2.circle(frame, 
-                      (int(pos.x * w), int(pos.y * h)), 
-                      2, (0, 255, 0), -1)
-        
-        # Display info near each face
+        # Display info with height value
         status_color = (0, 255, 0) if is_speaking else (0, 0, 255)
         status_text = f"Face {face_id+1}: {'Speaking' if is_speaking else 'Silent'}"
         cv2.putText(frame, f"{status_text} ({height:.3f})", 
                    (text_x, text_y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
-                   
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
+        
         return frame 
+
+    def calculate_lip_height(self, landmarks):
+        """Calculate normalized lip height using facial landmarks"""
+        # Get upper and lower lip points
+        upper_lip_y = np.mean([landmarks.landmark[i].y for i in self.UPPER_LIP_INDICES])
+        lower_lip_y = np.mean([landmarks.landmark[i].y for i in self.LOWER_LIP_INDICES])
+        
+        # Calculate lip distance
+        lip_height = abs(upper_lip_y - lower_lip_y)
+        
+        # Normalize by face height (using points 10 and 152 for face height)
+        face_height = abs(landmarks.landmark[10].y - landmarks.landmark[152].y)
+        
+        # Return normalized height
+        return lip_height / face_height if face_height > 0 else 0.0 
