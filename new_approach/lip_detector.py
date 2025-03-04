@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import mediapipe as mp
 from collections import defaultdict, deque
 import time
 import insightface
@@ -7,100 +8,243 @@ from insightface.app import FaceAnalysis
 
 class LipDetector:
     def __init__(self):
-        # Initialize InsightFace
+        # Initialize InsightFace for robust face detection
         self.app = FaceAnalysis(
-            allowed_modules=['detection', 'landmark_3d_68'], 
-            providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+            allowed_modules=['detection'], 
+            providers=['CPUExecutionProvider']
         )
         self.app.prepare(ctx_id=0, det_size=(640, 640))
         
+        # Initialize MediaPipe for accurate lip tracking
+        self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=4,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        
+        # MediaPipe lip indices
+        self.UPPER_LIP_INDICES = [13, 14, 312]  # Upper lip indices in MediaPipe
+        self.LOWER_LIP_INDICES = [17, 16, 15]   # Lower lip indices in MediaPipe
+        
         # Adjust parameters for more stable detection
         self.SILENCE_THRESHOLD = 0.035
-        self.MOVEMENT_THRESHOLD = 0.006
-        self.SILENCE_DURATION = 0.8    # Increased from 0.5 to 0.8 seconds
-        self.SPEAKING_FRAMES_THRESHOLD = 4  # New: require N consecutive speaking frames
+        self.MOVEMENT_THRESHOLD = 0.004
+        self.SILENCE_DURATION = 1.2    # Increased silence duration
+        self.SPEAKING_FRAMES_THRESHOLD = 3
         
-        # Define lip landmarks for 68-point model
-        self.UPPER_LIP_INDICES = [50, 51, 52]  # Upper lip indices
-        self.LOWER_LIP_INDICES = [58, 57, 56]  # Lower lip indices
-        
-        # Modified face tracking system
+        # Face tracking system
         self.face_histories = defaultdict(lambda: {
-            'distance_history': deque(maxlen=5),
-            'last_heights': deque(maxlen=10),
+            'last_heights': deque(maxlen=15),
             'last_speaking_time': time.time(),
             'is_speaking': False,
-            'speaking_frames_count': 0  # New: count consecutive speaking frames
+            'speaking_frames_count': 0
         })
+        
+        # Face tracking parameters
+        self.face_trackers = {}
+        self.next_face_id = 0
+        self.face_timeout = 60
+        self.iou_threshold = 0.3
     
-    def get_lip_heights(self, image):
-        # Get face analysis from InsightFace
+    def get_faces_and_lips(self, image):
+        # Use InsightFace for robust face detection
         faces = self.app.get(image)
         
         if not faces:
+            # Update tracking timeouts
+            for face_id in list(self.face_trackers.keys()):
+                self.face_trackers[face_id]['frames_missing'] += 1
+                if self.face_trackers[face_id]['frames_missing'] > self.face_timeout:
+                    del self.face_trackers[face_id]
             return []
-            
-        face_data = []
         
-        for face_idx, face in enumerate(faces):
-            landmarks = face.landmark_3d_68
-            if landmarks is None:
-                continue
+        # Current detections for matching
+        current_faces = []
+        
+        # Process with MediaPipe for accurate lip landmarks
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mp_results = self.mp_face_mesh.process(rgb_image)
+        
+        # First, match InsightFace detections with MediaPipe results
+        if mp_results.multi_face_landmarks:
+            mp_faces = mp_results.multi_face_landmarks
+            
+            # For each InsightFace detection
+            for face in faces:
+                bbox = face.bbox  # [x1, y1, x2, y2, score]
+                face_center_x = (bbox[0] + bbox[2]) / 2
+                face_center_y = (bbox[1] + bbox[3]) / 2
                 
-            # Calculate normalized height using 68-point landmarks
-            lip_height = self.calculate_lip_height(landmarks)
-            
-            face_data.append({
-                'id': face_idx,
-                'height': lip_height,
-                'landmarks': landmarks,
-                'bbox': face.bbox
-            })
+                # Find closest MediaPipe face
+                best_mp_face = None
+                best_distance = float('inf')
+                
+                for i, mp_face in enumerate(mp_faces):
+                    # Calculate MediaPipe face center
+                    mp_x = np.mean([lm.x for lm in mp_face.landmark]) * image.shape[1]
+                    mp_y = np.mean([lm.y for lm in mp_face.landmark]) * image.shape[0]
+                    
+                    # Calculate distance
+                    distance = np.sqrt((face_center_x - mp_x)**2 + (face_center_y - mp_y)**2)
+                    
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_mp_face = mp_face
+                
+                # If we found a matching MediaPipe face and it's close enough
+                if best_mp_face and best_distance < (bbox[2] - bbox[0]) * 0.5:
+                    # Calculate lip height using MediaPipe landmarks
+                    lip_height = self.calculate_lip_height_mediapipe(best_mp_face, image.shape)
+                    
+                    # Store detection
+                    current_faces.append({
+                        'temp_id': len(current_faces),
+                        'height': lip_height,
+                        'bbox': bbox,
+                        'mp_landmarks': best_mp_face
+                    })
         
-        return face_data
+        # If no MediaPipe matches, use InsightFace detections alone
+        if not current_faces and faces:
+            for face in faces:
+                bbox = face.bbox
+                # Use a default height since we don't have MediaPipe data
+                current_faces.append({
+                    'temp_id': len(current_faces),
+                    'height': 0.1,  # Default value
+                    'bbox': bbox,
+                    'mp_landmarks': None
+                })
+        
+        # Match current faces with tracked faces
+        matched_faces = []
+        unmatched_detections = list(range(len(current_faces)))
+        
+        # For each tracked face, find best matching detection
+        for face_id in list(self.face_trackers.keys()):
+            tracker = self.face_trackers[face_id]
+            best_match = -1
+            best_iou = self.iou_threshold
+            
+            for i in unmatched_detections:
+                iou = self.calculate_iou(tracker['bbox'], current_faces[i]['bbox'])
+                if iou > best_iou:
+                    best_match = i
+                    best_iou = iou
+            
+            if best_match >= 0:
+                # Update tracker with new detection
+                tracker['bbox'] = current_faces[best_match]['bbox']
+                tracker['frames_missing'] = 0
+                
+                # Add to matched faces with consistent ID
+                face_data = current_faces[best_match]
+                face_data['id'] = face_id
+                matched_faces.append(face_data)
+                
+                # Remove from unmatched
+                unmatched_detections.remove(best_match)
+            else:
+                # Face not found in current frame
+                tracker['frames_missing'] += 1
+                if tracker['frames_missing'] > self.face_timeout:
+                    del self.face_trackers[face_id]
+        
+        # Create new trackers for unmatched detections
+        for i in unmatched_detections:
+            face_id = self.next_face_id
+            self.next_face_id += 1
+            
+            # Create new tracker
+            self.face_trackers[face_id] = {
+                'bbox': current_faces[i]['bbox'],
+                'frames_missing': 0
+            }
+            
+            # Add to matched faces with new ID
+            face_data = current_faces[i]
+            face_data['id'] = face_id
+            matched_faces.append(face_data)
+        
+        return matched_faces
     
-    def calculate_lip_height(self, landmarks):
-        """Calculate normalized lip height using 68-point landmarks"""
+    def calculate_lip_height_mediapipe(self, face_landmarks, image_shape):
+        """Calculate normalized lip height using MediaPipe landmarks"""
+        h, w = image_shape[:2]
+        
         # Get upper and lower lip points
-        upper_lip_y = np.mean(landmarks[self.UPPER_LIP_INDICES][:, 1])
-        lower_lip_y = np.mean(landmarks[self.LOWER_LIP_INDICES][:, 1])
+        upper_lip_y = np.mean([face_landmarks.landmark[idx].y for idx in self.UPPER_LIP_INDICES]) * h
+        lower_lip_y = np.mean([face_landmarks.landmark[idx].y for idx in self.LOWER_LIP_INDICES]) * h
         
         # Calculate lip distance
         lip_height = abs(upper_lip_y - lower_lip_y)
         
-        # Normalize by face height (using nose bridge to chin)
-        face_height = abs(landmarks[27][1] - landmarks[8][1])  # Nose bridge to chin
+        # Normalize by face height (using nose to chin)
+        nose_y = face_landmarks.landmark[1].y * h  # Nose tip
+        chin_y = face_landmarks.landmark[152].y * h  # Chin
+        face_height = abs(nose_y - chin_y)
         
         return lip_height / face_height if face_height > 0 else 0.0
     
-    def draw_debug(self, frame, landmarks, height, is_speaking, face_id):
-        h, w, _ = frame.shape
+    def calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union for two bounding boxes"""
+        # Extract coordinates
+        x1_1, y1_1, x2_1, y2_1 = box1[:4]
+        x1_2, y1_2, x2_2, y2_2 = box2[:4]
         
-        # Calculate text position (keeping only the text, removing dots)
-        text_y = int(landmarks[27][1]) - 20  # Above nose bridge
-        text_x = int(landmarks[27][0])
+        # Calculate intersection area
+        x_left = max(x1_1, x1_2)
+        y_top = max(y1_1, y1_2)
+        x_right = min(x2_1, x2_2)
+        y_bottom = min(y2_1, y2_2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+        
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+        
+        # Calculate union area
+        box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+        box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union_area = box1_area + box2_area - intersection_area
+        
+        return intersection_area / union_area if union_area > 0 else 0.0
+    
+    def draw_debug(self, frame, face_data, is_speaking, face_id):
+        # Get bounding box
+        bbox = face_data['bbox']
+        x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+        
+        # Calculate text position
+        text_y = y1 - 10
+        text_x = x1
         
         # Display info
         status_color = (0, 255, 0) if is_speaking else (0, 0, 255)
         status_text = f"Face {face_id+1}: {'Speaking' if is_speaking else 'Silent'}"
-        cv2.putText(frame, f"{status_text} ({height:.3f})", 
+        cv2.putText(frame, f"{status_text} ({face_data['height']:.3f})", 
                    (text_x, text_y),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
+        
+        # Draw bounding box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), status_color, 2)
         
         return frame
     
     def detect_speaking(self, frame):
-        faces_data = self.get_lip_heights(frame)
+        faces_data = self.get_faces_and_lips(frame)
         current_time = time.time()
         
-        # Remove old faces
+        # Remove old faces from history
         active_faces = set(face['id'] for face in faces_data)
         for face_id in list(self.face_histories.keys()):
             if face_id not in active_faces:
-                if current_time - self.face_histories[face_id]['last_speaking_time'] > 2.0:  # Reduced timeout
+                if current_time - self.face_histories[face_id]['last_speaking_time'] > 2.0:
                     del self.face_histories[face_id]
         
-        # More stable speaking detection
+        # More stable speaking detection with hysteresis
         for face_data in faces_data:
             face_id = face_data['id']
             lip_height = face_data['height']
@@ -115,18 +259,17 @@ class LipDetector:
                 is_open = lip_height > self.SILENCE_THRESHOLD
                 
                 if is_moving and is_open:
-                    face_history['speaking_frames_count'] += 1
+                    face_history['speaking_frames_count'] += 2
                     if face_history['speaking_frames_count'] >= self.SPEAKING_FRAMES_THRESHOLD:
                         face_history['last_speaking_time'] = current_time
                         face_history['is_speaking'] = True
                 else:
-                    face_history['speaking_frames_count'] = 0
+                    face_history['speaking_frames_count'] = max(0, face_history['speaking_frames_count'] - 0.5)
                     if current_time - face_history['last_speaking_time'] > self.SILENCE_DURATION:
                         face_history['is_speaking'] = False
             
             # Draw debug visualization
-            frame = self.draw_debug(frame, face_data['landmarks'], 
-                                 lip_height, face_history['is_speaking'], face_id)
+            frame = self.draw_debug(frame, face_data, face_history['is_speaking'], face_id)
         
         return frame, {face_id: data['is_speaking'] 
                       for face_id, data in self.face_histories.items()} 
