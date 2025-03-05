@@ -47,10 +47,10 @@ def process_video(input_path, output_path):
         if not ret:
             break
             
-        # Process frame
+        # Process frame - this will now only draw lip dots
         frame, speaking_status = detector.detect_speaking(frame)
         
-        # Display overall status
+        # Add back the status text showing who is speaking
         y_pos = 30
         for face_id, is_speaking in speaking_status.items():
             status = f"Face {face_id+1}: {'Speaking' if is_speaking else 'Silent'}"

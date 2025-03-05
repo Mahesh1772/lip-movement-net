@@ -30,7 +30,7 @@ class LipDetector:
         
         # Adjust parameters for more stable detection
         self.SILENCE_THRESHOLD = 0.035
-        self.MOVEMENT_THRESHOLD = 0.004
+        self.MOVEMENT_THRESHOLD = 0.006
         self.SILENCE_DURATION = 1.2    # Increased silence duration
         self.SPEAKING_FRAMES_THRESHOLD = 3
         
@@ -215,21 +215,28 @@ class LipDetector:
     def draw_debug(self, frame, face_data, is_speaking, face_id):
         # Get bounding box
         bbox = face_data['bbox']
-        x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+        x1, y1, x2, y2 = map(int, bbox[:4])
         
-        # Calculate text position
-        text_y = y1 - 10
-        text_x = x1
+        # Draw face ID text above the face
+        face_id_text = f"Face {face_id}"
+        cv2.putText(frame, face_id_text, (x1, y1 - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        # Display info
-        status_color = (0, 255, 0) if is_speaking else (0, 0, 255)
-        status_text = f"Face {face_id+1}: {'Speaking' if is_speaking else 'Silent'}"
-        cv2.putText(frame, f"{status_text} ({face_data['height']:.3f})", 
-                   (text_x, text_y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
-        
-        # Draw bounding box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), status_color, 2)
+        # Draw lip landmarks if MediaPipe landmarks are available
+        if face_data['mp_landmarks'] is not None:
+            # Get lip landmark indices (upper and lower lip points)
+            lip_indices = self.UPPER_LIP_INDICES + self.LOWER_LIP_INDICES
+            
+            # Draw dots for lip landmarks
+            for idx in lip_indices:
+                landmark = face_data['mp_landmarks'].landmark[idx]
+                x = int(landmark.x * frame.shape[1])
+                y = int(landmark.y * frame.shape[0])
+                
+                # Draw a small circle at each lip landmark
+                # Green for speaking, red for silent
+                color = (0, 255, 0) if is_speaking else (0, 0, 255)
+                cv2.circle(frame, (x, y), 2, color, -1)
         
         return frame
     
