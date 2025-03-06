@@ -5,6 +5,15 @@ from collections import defaultdict, deque
 import time
 import insightface
 from insightface.app import FaceAnalysis
+import sys
+import os
+import torch
+
+# Import directly from the specific location
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+from ByteTrack.yolox.tracker.byte_tracker import BYTETracker, STrack
+from onemetric.cv.utils.iou import box_iou_batch
 
 class LipDetector:
     def __init__(self):
@@ -29,9 +38,9 @@ class LipDetector:
         self.LOWER_LIP_INDICES = [17, 16, 15]   # Lower lip indices in MediaPipe
         
         # Adjust parameters for more stable detection
-        self.SILENCE_THRESHOLD = 0.035
+        self.SILENCE_THRESHOLD = 0.0375
         self.MOVEMENT_THRESHOLD = 0.006
-        self.SILENCE_DURATION = 1.2    # Increased silence duration
+        self.SILENCE_DURATION = 1.5    # Increased silence duration
         self.SPEAKING_FRAMES_THRESHOLD = 3
         
         # Face tracking system
@@ -42,32 +51,45 @@ class LipDetector:
             'speaking_frames_count': 0
         })
         
-        # Face tracking parameters
-        self.face_trackers = {}
-        self.next_face_id = 0
-        self.face_timeout = 60
-        self.iou_threshold = 0.3
+        # Initialize ByteTracker
+        class Args:
+            def __init__(self):
+                self.track_thresh = 0.5
+                self.track_buffer = 30
+                self.match_thresh = 0.8
+                self.frame_rate = 30
+                self.mot20 = False  # Add this missing attribute
+
+        self.tracker = BYTETracker(Args())
+        
+        self.frame_id = 0  # Frame counter for ByteTracker
     
     def get_faces_and_lips(self, image):
         # Use InsightFace for robust face detection
         faces = self.app.get(image)
         
         if not faces:
-            # Update tracking timeouts
-            for face_id in list(self.face_trackers.keys()):
-                self.face_trackers[face_id]['frames_missing'] += 1
-                if self.face_trackers[face_id]['frames_missing'] > self.face_timeout:
-                    del self.face_trackers[face_id]
+            # Update ByteTracker with empty detections
+            self.frame_id += 1
+            empty_tensor = torch.zeros((0, 6))  # Empty tensor with correct shape
+            self.tracker.update(
+                empty_tensor,
+                [image.shape[0], image.shape[1]],
+                [image.shape[0], image.shape[1]]
+            )
             return []
         
-        # Current detections for matching
-        current_faces = []
+        # Current detections for ByteTracker
+        detections = []
+        scores = []
         
         # Process with MediaPipe for accurate lip landmarks
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         mp_results = self.mp_face_mesh.process(rgb_image)
         
-        # First, match InsightFace detections with MediaPipe results
+        # Match InsightFace detections with MediaPipe results
+        current_faces = []
+        
         if mp_results.multi_face_landmarks:
             mp_faces = mp_results.multi_face_landmarks
             
@@ -76,6 +98,10 @@ class LipDetector:
                 bbox = face.bbox  # [x1, y1, x2, y2, score]
                 face_center_x = (bbox[0] + bbox[2]) / 2
                 face_center_y = (bbox[1] + bbox[3]) / 2
+                
+                # Add to ByteTracker detections
+                detections.append([bbox[0], bbox[1], bbox[2], bbox[3]])
+                scores.append(face.det_score)
                 
                 # Find closest MediaPipe face
                 best_mp_face = None
@@ -108,67 +134,65 @@ class LipDetector:
         
         # If no MediaPipe matches, use InsightFace detections alone
         if not current_faces and faces:
-            for face in faces:
+            for i, face in enumerate(faces):
                 bbox = face.bbox
                 # Use a default height since we don't have MediaPipe data
                 current_faces.append({
-                    'temp_id': len(current_faces),
+                    'temp_id': i,
                     'height': 0.1,  # Default value
                     'bbox': bbox,
                     'mp_landmarks': None
                 })
         
-        # Match current faces with tracked faces
-        matched_faces = []
-        unmatched_detections = list(range(len(current_faces)))
+        # Update ByteTracker with current detections
+        self.frame_id += 1
         
-        # For each tracked face, find best matching detection
-        for face_id in list(self.face_trackers.keys()):
-            tracker = self.face_trackers[face_id]
-            best_match = -1
-            best_iou = self.iou_threshold
+        # Convert detections to numpy array for ByteTracker
+        if detections:
+            # Format: [x1, y1, x2, y2, obj_conf, class_conf]
+            formatted_detections = []
+            for i, box in enumerate(detections):
+                # Add confidence scores (obj_conf and class_conf)
+                formatted_box = list(box) + [scores[i], 1.0]  # Add object confidence and class confidence
+                formatted_detections.append(formatted_box)
             
-            for i in unmatched_detections:
-                iou = self.calculate_iou(tracker['bbox'], current_faces[i]['bbox'])
-                if iou > best_iou:
-                    best_match = i
-                    best_iou = iou
+            detections_np = np.array(formatted_detections)
             
-            if best_match >= 0:
-                # Update tracker with new detection
-                tracker['bbox'] = current_faces[best_match]['bbox']
-                tracker['frames_missing'] = 0
+            # Convert NumPy arrays to PyTorch tensors
+            detections_tensor = torch.from_numpy(detections_np)
+            
+            # Update tracker
+            online_targets = self.tracker.update(
+                detections_tensor,
+                [image.shape[0], image.shape[1]],  # Image dimensions (height, width)
+                [image.shape[0], image.shape[1]]   # Image size (same as dimensions in this case)
+            )
+            
+            # Match tracked objects with current faces
+            if online_targets and current_faces:
+                # Get bounding boxes from tracked objects
+                track_boxes = np.array([[t.tlbr[0], t.tlbr[1], t.tlbr[2], t.tlbr[3]] for t in online_targets])
                 
-                # Add to matched faces with consistent ID
-                face_data = current_faces[best_match]
-                face_data['id'] = face_id
-                matched_faces.append(face_data)
+                # Get bounding boxes from current faces
+                face_boxes = np.array([[f['bbox'][0], f['bbox'][1], f['bbox'][2], f['bbox'][3]] for f in current_faces])
                 
-                # Remove from unmatched
-                unmatched_detections.remove(best_match)
-            else:
-                # Face not found in current frame
-                tracker['frames_missing'] += 1
-                if tracker['frames_missing'] > self.face_timeout:
-                    del self.face_trackers[face_id]
+                # Calculate IoU between tracked boxes and face boxes
+                iou_matrix = box_iou_batch(track_boxes, face_boxes)
+                
+                # Match faces with tracks
+                for i, track in enumerate(online_targets):
+                    if i < len(iou_matrix):
+                        best_match = np.argmax(iou_matrix[i])
+                        if best_match < len(current_faces) and iou_matrix[i][best_match] > 0.5:
+                            # Assign track ID to face
+                            current_faces[best_match]['id'] = track.track_id
         
-        # Create new trackers for unmatched detections
-        for i in unmatched_detections:
-            face_id = self.next_face_id
-            self.next_face_id += 1
-            
-            # Create new tracker
-            self.face_trackers[face_id] = {
-                'bbox': current_faces[i]['bbox'],
-                'frames_missing': 0
-            }
-            
-            # Add to matched faces with new ID
-            face_data = current_faces[i]
-            face_data['id'] = face_id
-            matched_faces.append(face_data)
+        # Ensure all faces have an ID (fallback to temp_id if not matched)
+        for face in current_faces:
+            if 'id' not in face:
+                face['id'] = face['temp_id']
         
-        return matched_faces
+        return current_faces
     
     def calculate_lip_height_mediapipe(self, face_landmarks, image_shape):
         """Calculate normalized lip height using MediaPipe landmarks"""
@@ -244,20 +268,39 @@ class LipDetector:
         faces_data = self.get_faces_and_lips(frame)
         current_time = time.time()
         
-        # Remove old faces from history
-        active_faces = set(face['id'] for face in faces_data)
-        for face_id in list(self.face_histories.keys()):
-            if face_id not in active_faces:
-                if current_time - self.face_histories[face_id]['last_speaking_time'] > 2.0:
-                    del self.face_histories[face_id]
+        # Get current face IDs in this frame
+        current_face_ids = {face_data['id'] for face_data in faces_data}
         
-        # More stable speaking detection with hysteresis
+        # Only remove histories for faces that haven't been seen in a while
+        # (instead of clearing all histories every frame)
+        face_ids_to_remove = []
+        for face_id in self.face_histories:
+            if face_id not in current_face_ids:
+                # If this face hasn't been seen for more than 5 seconds, remove it
+                if current_time - self.face_histories[face_id]['last_speaking_time'] > 5.0:
+                    face_ids_to_remove.append(face_id)
+        
+        # Remove old face histories
+        for face_id in face_ids_to_remove:
+            del self.face_histories[face_id]
+        
+        # Process each face in the current frame
         for face_data in faces_data:
             face_id = face_data['id']
             lip_height = face_data['height']
-            face_history = self.face_histories[face_id]
             
+            # Initialize history for this face if needed
+            if face_id not in self.face_histories:
+                self.face_histories[face_id] = {
+                    'last_heights': deque(maxlen=15),
+                    'last_speaking_time': current_time,
+                    'is_speaking': False,
+                    'speaking_frames_count': 0
+                }
+            
+            face_history = self.face_histories[face_id]
             face_history['last_heights'].append(lip_height)
+            
             if len(face_history['last_heights']) >= 5:
                 recent_heights = list(face_history['last_heights'])[-5:]
                 variation = np.std(recent_heights)
