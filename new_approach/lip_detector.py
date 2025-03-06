@@ -71,7 +71,7 @@ class LipDetector:
         if not faces:
             # Update ByteTracker with empty detections
             self.frame_id += 1
-            empty_tensor = torch.zeros((0, 6))  # Empty tensor with correct shape
+            empty_tensor = torch.zeros((0, 6))
             self.tracker.update(
                 empty_tensor,
                 [image.shape[0], image.shape[1]],
@@ -79,16 +79,28 @@ class LipDetector:
             )
             return []
         
+        # Determine if this is a wide angle shot
+        is_wide_shot = self.is_wide_angle_shot(image, faces)
+
+        
         # Current detections for ByteTracker
         detections = []
         scores = []
+        current_faces = []
         
-        # Process with MediaPipe for accurate lip landmarks
+        # For wide shots, we need to be more aggressive with lip detection
+        if is_wide_shot:
+            # Increase MediaPipe confidence thresholds for wide shots
+            self.mp_face_mesh.min_detection_confidence = 0.3
+            self.mp_face_mesh.min_tracking_confidence = 0.3
+        else:
+            # Reset to normal values for close-ups
+            self.mp_face_mesh.min_detection_confidence = 0.5
+            self.mp_face_mesh.min_tracking_confidence = 0.5
+        
+        # Process with MediaPipe for lip landmarks (always)
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         mp_results = self.mp_face_mesh.process(rgb_image)
-        
-        # Match InsightFace detections with MediaPipe results
-        current_faces = []
         
         if mp_results.multi_face_landmarks:
             mp_faces = mp_results.multi_face_landmarks
@@ -121,15 +133,21 @@ class LipDetector:
                 
                 # If we found a matching MediaPipe face and it's close enough
                 if best_mp_face and best_distance < (bbox[2] - bbox[0]) * 0.5:
-                    # Calculate lip height using MediaPipe landmarks
-                    lip_height = self.calculate_lip_height_mediapipe(best_mp_face, image.shape)
+                    # Calculate lip height using appropriate method based on shot type
+                    if is_wide_shot and hasattr(face, 'landmark_3d_68') and face.landmark_3d_68 is not None:
+                        # Use InsightFace landmarks for lip height in wide shots
+                        lip_height = self.calculate_lip_height_insightface(face.landmark_3d_68)
+                    else:
+                        # Use MediaPipe landmarks for lip height
+                        lip_height = self.calculate_lip_height_mediapipe(best_mp_face, image.shape)
                     
                     # Store detection
                     current_faces.append({
                         'temp_id': len(current_faces),
                         'height': lip_height,
                         'bbox': bbox,
-                        'mp_landmarks': best_mp_face
+                        'mp_landmarks': best_mp_face,
+                        'is_wide_shot': is_wide_shot
                     })
         
         # If no MediaPipe matches, use InsightFace detections alone
@@ -141,7 +159,8 @@ class LipDetector:
                     'temp_id': i,
                     'height': 0.1,  # Default value
                     'bbox': bbox,
-                    'mp_landmarks': None
+                    'mp_landmarks': None,
+                    'is_wide_shot': is_wide_shot
                 })
         
         # Update ByteTracker with current detections
@@ -247,20 +266,20 @@ class LipDetector:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         # Draw lip landmarks if MediaPipe landmarks are available
+        color = (0, 255, 0) if is_speaking else (0, 0, 255)
+        
         if face_data['mp_landmarks'] is not None:
-            # Get lip landmark indices (upper and lower lip points)
+            # Draw MediaPipe landmarks for all shots
             lip_indices = self.UPPER_LIP_INDICES + self.LOWER_LIP_INDICES
             
-            # Draw dots for lip landmarks
+            # Make dots larger in wide shots for better visibility
+            dot_size = 4 if face_data.get('is_wide_shot', False) else 2
+            
             for idx in lip_indices:
                 landmark = face_data['mp_landmarks'].landmark[idx]
                 x = int(landmark.x * frame.shape[1])
                 y = int(landmark.y * frame.shape[0])
-                
-                # Draw a small circle at each lip landmark
-                # Green for speaking, red for silent
-                color = (0, 255, 0) if is_speaking else (0, 0, 255)
-                cv2.circle(frame, (x, y), 2, color, -1)
+                cv2.circle(frame, (x, y), dot_size, color, -1)
         
         return frame
     
@@ -272,7 +291,6 @@ class LipDetector:
         current_face_ids = {face_data['id'] for face_data in faces_data}
         
         # Only remove histories for faces that haven't been seen in a while
-        # (instead of clearing all histories every frame)
         face_ids_to_remove = []
         for face_id in self.face_histories:
             if face_id not in current_face_ids:
@@ -288,6 +306,16 @@ class LipDetector:
         for face_data in faces_data:
             face_id = face_data['id']
             lip_height = face_data['height']
+            is_wide_shot = face_data.get('is_wide_shot', False)
+            
+            # Use different thresholds based on shot type
+            if is_wide_shot:
+                # Much more sensitive thresholds for wide shots
+                movement_threshold = self.MOVEMENT_THRESHOLD * 0.25  # 4x more sensitive
+                silence_threshold = self.SILENCE_THRESHOLD * 0.6     # Lower threshold
+            else:
+                movement_threshold = self.MOVEMENT_THRESHOLD
+                silence_threshold = self.SILENCE_THRESHOLD
             
             # Initialize history for this face if needed
             if face_id not in self.face_histories:
@@ -305,8 +333,8 @@ class LipDetector:
                 recent_heights = list(face_history['last_heights'])[-5:]
                 variation = np.std(recent_heights)
                 
-                is_moving = variation > self.MOVEMENT_THRESHOLD
-                is_open = lip_height > self.SILENCE_THRESHOLD
+                is_moving = variation > movement_threshold
+                is_open = lip_height > silence_threshold
                 
                 if is_moving and is_open:
                     face_history['speaking_frames_count'] += 2
@@ -323,3 +351,54 @@ class LipDetector:
         
         return frame, {face_id: data['is_speaking'] 
                       for face_id, data in self.face_histories.items()} 
+    
+    def is_wide_angle_shot(self, image, faces):
+        """
+        Determine if the current frame is a wide angle shot based solely on
+        face size relative to the frame
+        """
+        if not faces:
+            print(f"Frame {self.frame_id}: No faces detected")
+            return False
+        
+        # Calculate face sizes relative to frame
+        frame_height, frame_width = image.shape[:2]
+        frame_area = frame_height * frame_width
+        
+        max_face_ratio = 0
+        
+        for face in faces:
+            bbox = face.bbox
+            face_width = bbox[2] - bbox[0]
+            face_height = bbox[3] - bbox[1]
+            face_area = face_width * face_height
+            face_ratio = face_area / frame_area
+            
+            # Keep track of the largest face
+            max_face_ratio = max(max_face_ratio, face_ratio)
+        
+        # Use face size as the only criterion - adjust threshold as needed
+        is_wide = max_face_ratio < 0.02
+        
+        return is_wide
+
+    def calculate_lip_height_insightface(self, landmarks):
+        """Calculate normalized lip height using InsightFace landmarks"""
+        # InsightFace landmark indices for upper and lower lips
+        # These may need adjustment based on InsightFace's landmark mapping
+        upper_lip_indices = [62, 63, 64]  # Upper lip indices in InsightFace
+        lower_lip_indices = [66, 67, 68]  # Lower lip indices in InsightFace
+        
+        # Get upper and lower lip points
+        upper_lip_y = np.mean([landmarks[idx][1] for idx in upper_lip_indices])
+        lower_lip_y = np.mean([landmarks[idx][1] for idx in lower_lip_indices])
+        
+        # Calculate lip distance
+        lip_height = abs(upper_lip_y - lower_lip_y)
+        
+        # Normalize by face height (using nose to chin)
+        nose_y = landmarks[30][1]  # Nose tip
+        chin_y = landmarks[8][1]   # Chin
+        face_height = abs(nose_y - chin_y)
+        
+        return lip_height / face_height if face_height > 0 else 0.0 
