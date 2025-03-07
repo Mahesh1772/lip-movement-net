@@ -27,7 +27,7 @@ class EnhancedLipDetector:
         # Initialize MediaPipe for accurate lip tracking
         self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
-            max_num_faces=4,
+            max_num_faces=8,  # Increased to handle more faces
             refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
@@ -48,7 +48,8 @@ class EnhancedLipDetector:
             'last_heights': deque(maxlen=15),
             'last_speaking_time': time.time(),
             'is_speaking': False,
-            'speaking_frames_count': 0
+            'speaking_frames_count': 0,
+            'display_id': None  # For consistent display IDs
         })
         
         # Initialize ByteTracker
@@ -66,6 +67,12 @@ class EnhancedLipDetector:
         
         # For wide shots, use a simpler approach based on mouth region intensity changes
         self.face_mouth_regions = {}  # Store mouth regions for each face
+        
+        # For consistent face IDs display
+        self.next_display_id = 0
+        self.id_mapping = {}  # Maps ByteTrack IDs to display IDs
+        self.active_display_ids = set()  # Track currently active display IDs
+        self.max_id_seen = 0  # Track the highest ID we've assigned
     
     def get_faces_and_lips(self, image):
         # Use InsightFace for robust face detection
@@ -227,7 +234,7 @@ class EnhancedLipDetector:
                 [image.shape[0], image.shape[1]]
             )
             
-            # Match tracked objects with current faces
+            # Match faces with tracks
             if online_targets and current_faces:
                 # Get bounding boxes from tracked objects
                 track_boxes = np.array([[t.tlbr[0], t.tlbr[1], t.tlbr[2], t.tlbr[3]] for t in online_targets])
@@ -245,11 +252,32 @@ class EnhancedLipDetector:
                         if best_match < len(current_faces) and iou_matrix[i][best_match] > 0.5:
                             # Assign track ID to face
                             current_faces[best_match]['id'] = track.track_id
+                            
+                            # Assign display ID if this is a new track
+                            if track.track_id not in self.id_mapping:
+                                # Find the lowest available ID
+                                available_id = 0
+                                used_ids = set(self.id_mapping.values())
+                                
+                                # Find the first available ID starting from 0
+                                while available_id in used_ids:
+                                    available_id += 1
+                                
+                                self.id_mapping[track.track_id] = available_id
+                                self.max_id_seen = max(self.max_id_seen, available_id)
+                                self.active_display_ids.add(available_id)
+                            
+                            # Store display ID in face data
+                            current_faces[best_match]['display_id'] = self.id_mapping[track.track_id]
+                            self.active_display_ids.add(self.id_mapping[track.track_id])
         
         # Ensure all faces have an ID (fallback to temp_id if not matched)
         for face in current_faces:
             if 'id' not in face:
                 face['id'] = face['temp_id']
+                
+                # Assign a temporary display ID
+                face['display_id'] = 999 + face['temp_id']  # Use high numbers for temporary IDs
         
         return current_faces
     
@@ -262,21 +290,35 @@ class EnhancedLipDetector:
         
         # Only remove histories for faces that haven't been seen in a while
         face_ids_to_remove = []
+        track_ids_to_remove = []
         for face_id in self.face_histories:
             if face_id not in current_face_ids:
                 # If this face hasn't been seen for more than 5 seconds, remove it
                 if current_time - self.face_histories[face_id]['last_speaking_time'] > 5.0:
                     face_ids_to_remove.append(face_id)
-        
+                    
+                    # Find the corresponding track ID to remove from mapping
+                    for track_id, display_id in self.id_mapping.items():
+                        if display_id == self.face_histories[face_id]['display_id']:
+                            track_ids_to_remove.append(track_id)
+                            self.active_display_ids.discard(display_id)
+                            break
+
         # Remove old face histories
         for face_id in face_ids_to_remove:
             del self.face_histories[face_id]
             if face_id in self.face_mouth_regions:
                 del self.face_mouth_regions[face_id]
+
+        # Remove old track ID mappings
+        for track_id in track_ids_to_remove:
+            if track_id in self.id_mapping:
+                del self.id_mapping[track_id]
         
         # Process each face in the current frame
         for face_data in faces_data:
             face_id = face_data['id']
+            display_id = face_data.get('display_id', face_id)  # Use display_id if available
             is_wide_shot = face_data.get('is_wide_shot', False)
             
             # Initialize history for this face if needed
@@ -286,8 +328,12 @@ class EnhancedLipDetector:
                     'last_speaking_time': current_time,
                     'is_speaking': False,
                     'speaking_frames_count': 0,
-                    'mouth_diff_history': deque(maxlen=10)
+                    'mouth_diff_history': deque(maxlen=10),
+                    'display_id': display_id
                 }
+            else:
+                # Update display ID in history
+                self.face_histories[face_id]['display_id'] = display_id
             
             face_history = self.face_histories[face_id]
             
@@ -342,10 +388,6 @@ class EnhancedLipDetector:
                     # Thresholds for wide shots
                     movement_threshold = 2.0  # Adjust based on testing
                     
-                    # Debug print every 30 frames
-                    if self.frame_id % 30 == 0:
-                        print(f"Face {face_id} (wide): mean_diff={mean_diff:.2f}, std_diff={std_diff:.2f}")
-                    
                     # Determine if speaking
                     is_moving = mean_diff > movement_threshold or std_diff > movement_threshold/2
                     
@@ -367,9 +409,6 @@ class EnhancedLipDetector:
                     recent_heights = list(face_history['last_heights'])[-5:]
                     variation = np.std(recent_heights)
                     
-                    # Debug print every 30 frames
-                    if self.frame_id % 30 == 0 and not is_wide_shot:
-                        print(f"Face {face_id} (close): height={lip_height:.4f}, var={variation:.6f}")
                     
                     # Standard thresholds for close-ups
                     movement_threshold = self.MOVEMENT_THRESHOLD
@@ -389,18 +428,75 @@ class EnhancedLipDetector:
                             face_history['is_speaking'] = False
             
             # Draw debug visualization
-            frame = self.draw_debug(frame, face_data, face_history['is_speaking'], face_id)
+            frame = self.draw_debug(frame, face_data, face_history['is_speaking'], display_id)
+        
+        # Add face counter and speaking status to top-left corner
+        y_offset = 30
+        cv2.putText(frame, f"Total faces: {len(faces_data)}", (10, y_offset), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Add speaking status for each face
+        active_faces = {}
+        for face_id, data in self.face_histories.items():
+            if face_id in current_face_ids:  # Only show active faces
+                display_id = data['display_id']
+                active_faces[display_id] = data['is_speaking']
+
+        # Sort by display ID for consistent ordering
+        for display_id in sorted(active_faces.keys()):
+            y_offset += 30
+            is_speaking = active_faces[display_id]
+            status = "Speaking" if is_speaking else "Silent"
+            color = (0, 255, 0) if is_speaking else (0, 0, 255)
+            cv2.putText(frame, f"Face {display_id}: {status}", (10, y_offset), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        # Periodically reset IDs if we have fewer faces than max_id_seen
+        if self.frame_id % 150 == 0 and len(faces_data) < self.max_id_seen:
+            # Get current active face IDs
+            active_track_ids = set()
+            for face in faces_data:
+                if 'id' in face:
+                    active_track_ids.add(face['id'])
+            
+            # Get active display IDs
+            active_display_ids = set()
+            for track_id, display_id in list(self.id_mapping.items()):
+                if track_id in active_track_ids:
+                    active_display_ids.add(display_id)
+            
+            # If we have gaps in our IDs, reassign them
+            if len(active_display_ids) < max(active_display_ids) + 1:
+                # Create new mapping
+                new_mapping = {}
+                new_id = 0
+                
+                # Assign new sequential IDs
+                for track_id in active_track_ids:
+                    if track_id in self.id_mapping:
+                        new_mapping[track_id] = new_id
+                        new_id += 1
+                
+                # Update mapping
+                self.id_mapping = new_mapping
+                self.max_id_seen = new_id - 1
+                self.active_display_ids = set(range(new_id))
+                
+                # Update face display IDs
+                for face in faces_data:
+                    if 'id' in face and face['id'] in self.id_mapping:
+                        face['display_id'] = self.id_mapping[face['id']]
         
         return frame, {face_id: data['is_speaking'] 
                       for face_id, data in self.face_histories.items()}
     
-    def draw_debug(self, frame, face_data, is_speaking, face_id):
+    def draw_debug(self, frame, face_data, is_speaking, display_id):
         # Get bounding box
         bbox = face_data['bbox']
         x1, y1, x2, y2 = map(int, bbox[:4])
         
         # Draw face ID text above the face
-        face_id_text = f"Face {face_id}"
+        face_id_text = f"Face {display_id}"
         cv2.putText(frame, face_id_text, (x1, y1 - 10), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
@@ -421,31 +517,14 @@ class EnhancedLipDetector:
                 y = int(landmark.y * frame.shape[0])
                 cv2.circle(frame, (x, y), dot_size, color, -1)
         
-        # For wide shots or when MediaPipe fails, draw mouth region
+        # For wide shots or when MediaPipe fails, draw only mouth region rectangle
         elif 'mouth_region' in face_data:
             mouth = face_data['mouth_region']
-            # Draw mouth region rectangle
+            # Draw mouth region rectangle with transparent fill (only borders)
             cv2.rectangle(frame, 
                          (mouth['x1'], mouth['y1']), 
                          (mouth['x2'], mouth['y2']), 
-                         color, 1)
-            
-            # Draw lip points (estimated)
-            mouth_width = mouth['x2'] - mouth['x1']
-            mouth_height = mouth['y2'] - mouth['y1']
-            
-            # Draw 6 points around the mouth region
-            points = [
-                (mouth['x1'] + int(mouth_width * 0.25), mouth['y1'] + int(mouth_height * 0.3)),
-                (mouth['x1'] + int(mouth_width * 0.5), mouth['y1'] + int(mouth_height * 0.3)),
-                (mouth['x1'] + int(mouth_width * 0.75), mouth['y1'] + int(mouth_height * 0.3)),
-                (mouth['x1'] + int(mouth_width * 0.25), mouth['y1'] + int(mouth_height * 0.7)),
-                (mouth['x1'] + int(mouth_width * 0.5), mouth['y1'] + int(mouth_height * 0.7)),
-                (mouth['x1'] + int(mouth_width * 0.75), mouth['y1'] + int(mouth_height * 0.7))
-            ]
-            
-            for point in points:
-                cv2.circle(frame, point, 4, color, -1)
+                         color, 2)  # Increased thickness for better visibility
         
         return frame
     
@@ -491,7 +570,5 @@ class EnhancedLipDetector:
         # Use face size as the criterion
         is_wide = max_face_ratio < 0.02
         
-        if self.frame_id % 30 == 0:
-            print(f"Frame {self.frame_id}: Shot type = {'Wide angle' if is_wide else 'Close-up'} (ratio: {max_face_ratio:.6f})")
         
         return is_wide 
