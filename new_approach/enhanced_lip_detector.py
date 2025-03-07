@@ -43,6 +43,11 @@ class EnhancedLipDetector:
         self.SILENCE_DURATION = 1.5    # Increased silence duration
         self.SPEAKING_FRAMES_THRESHOLD = 3
         
+        # Close-up specific parameters
+        self.CLOSEUP_SILENCE_DURATION = 2.5  # Longer silence duration for close-ups
+        self.CLOSEUP_DECAY_RATE = 0.25  # Slower decay for close-ups
+        self.MIN_SPEAKING_DURATION = 1.0  # Minimum speaking duration
+        
         # Face tracking system
         self.face_histories = defaultdict(lambda: {
             'last_heights': deque(maxlen=15),
@@ -329,7 +334,8 @@ class EnhancedLipDetector:
                     'is_speaking': False,
                     'speaking_frames_count': 0,
                     'mouth_diff_history': deque(maxlen=10),
-                    'display_id': display_id
+                    'display_id': display_id,
+                    'speaking_start_time': current_time
                 }
             else:
                 # Update display ID in history
@@ -386,7 +392,7 @@ class EnhancedLipDetector:
                     std_diff = np.std(recent_diffs)
                     
                     # Thresholds for wide shots
-                    movement_threshold = 2.0  # Adjust based on testing
+                    movement_threshold = 2.5  # Increased from 2.0 to 2.5 to reduce false positives from head movement
                     
                     # Determine if speaking
                     is_moving = mean_diff > movement_threshold or std_diff > movement_threshold/2
@@ -420,11 +426,17 @@ class EnhancedLipDetector:
                     if is_moving and is_open:
                         face_history['speaking_frames_count'] += 2
                         if face_history['speaking_frames_count'] >= self.SPEAKING_FRAMES_THRESHOLD:
+                            if not face_history['is_speaking']:
+                                # Just started speaking - record the time
+                                face_history['speaking_start_time'] = current_time
                             face_history['last_speaking_time'] = current_time
                             face_history['is_speaking'] = True
                     else:
-                        face_history['speaking_frames_count'] = max(0, face_history['speaking_frames_count'] - 0.5)
-                        if current_time - face_history['last_speaking_time'] > self.SILENCE_DURATION:
+                        face_history['speaking_frames_count'] = max(0, face_history['speaking_frames_count'] - self.CLOSEUP_DECAY_RATE)
+                        # Only transition to silent if minimum speaking duration has passed
+                        if (face_history['is_speaking'] and 
+                            current_time - face_history['speaking_start_time'] > self.MIN_SPEAKING_DURATION and
+                            current_time - face_history['last_speaking_time'] > self.CLOSEUP_SILENCE_DURATION):
                             face_history['is_speaking'] = False
             
             # Draw debug visualization
@@ -465,8 +477,8 @@ class EnhancedLipDetector:
                 if track_id in active_track_ids:
                     active_display_ids.add(display_id)
             
-            # If we have gaps in our IDs, reassign them
-            if len(active_display_ids) < max(active_display_ids) + 1:
+            # If we have gaps in our IDs and we have active display IDs
+            if active_display_ids and len(active_display_ids) < max(active_display_ids) + 1:
                 # Create new mapping
                 new_mapping = {}
                 new_id = 0

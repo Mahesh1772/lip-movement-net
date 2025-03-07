@@ -1,8 +1,12 @@
 import cv2
 import argparse
 from enhanced_lip_detector import EnhancedLipDetector
+from tqdm import tqdm
 
 def process_video(input_path, output_path):
+    # Initialize detector
+    detector = EnhancedLipDetector()
+    
     # Open video
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -13,30 +17,29 @@ def process_video(input_path, output_path):
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Create output video writer
+    # Initialize video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
-    # Initialize detector
-    detector = EnhancedLipDetector()
-    
-    frame_count = 0
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Process frame
-        processed_frame, speaking_status = detector.detect_speaking(frame)
-        
-        # Write frame
-        out.write(processed_frame)
-        
-        frame_count += 1
-        if frame_count % 30 == 0:
-            print(f"Processed {frame_count} frames")
+    # Process each frame with tqdm progress bar
+    with tqdm(total=total_frames, desc="Processing video") as pbar:
+        frame_count = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Process frame
+            processed_frame, speaking_status = detector.detect_speaking(frame)
+            
+            # Write to output video
+            out.write(processed_frame)
+            
+            # Update progress bar
+            frame_count += 1
+            pbar.update(1)
     
     # Release resources
     cap.release()
@@ -44,10 +47,9 @@ def process_video(input_path, output_path):
     print(f"Video processing complete. Output saved to {output_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Test Enhanced Lip Detector")
-    parser.add_argument("--input", required=True, help="Path to input video")
-    parser.add_argument("--output", required=True, help="Path to output video")
-    
+    parser = argparse.ArgumentParser(description='Process video for lip movement detection')
+    parser.add_argument('--input', required=True, help='Input video path')
+    parser.add_argument('--output', required=True, help='Output video path')
     args = parser.parse_args()
     
     process_video(args.input, args.output)
