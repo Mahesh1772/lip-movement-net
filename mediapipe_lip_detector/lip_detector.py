@@ -3,26 +3,16 @@ import numpy as np
 import mediapipe as mp
 from collections import defaultdict, deque
 import time
-import insightface
-from insightface.app import FaceAnalysis
-import torch
 
 class MediaPipeLipDetector:
     def __init__(self):
-        # Initialize InsightFace for robust face detection
-        self.app = FaceAnalysis(
-            allowed_modules=['detection'], 
-            providers=['CPUExecutionProvider']
-        )
-        self.app.prepare(ctx_id=0, det_size=(640, 640))
-        
-        # Initialize MediaPipe for accurate lip tracking
+        # Initialize MediaPipe for face detection and lip tracking
         self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=8,
             refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.3,  # Lower detection confidence
+            min_tracking_confidence=0.3    # Lower tracking confidence
         )
         
         # MediaPipe lip indices
@@ -30,12 +20,15 @@ class MediaPipeLipDetector:
         self.LOWER_LIP_INDICES = [17, 16, 15]   # Lower lip indices in MediaPipe
         
         # Parameters for speaking detection
-        self.SILENCE_THRESHOLD = 0.0375
-        self.MOVEMENT_THRESHOLD = 0.006
-        self.SILENCE_DURATION = 2.5    # Increased silence duration
-        self.SPEAKING_FRAMES_THRESHOLD = 3
-        self.DECAY_RATE = 0.25  # Slower decay
-        self.MIN_SPEAKING_DURATION = 1.0  # Minimum speaking duration
+        self.SILENCE_THRESHOLD = 0.04           # Threshold for open mouth
+        self.MOVEMENT_THRESHOLD = 0.01          # Increased to reduce false positives
+        self.SILENCE_DURATION = 2.5             # Increased silence duration
+        self.SPEAKING_FRAMES_THRESHOLD = 6      # Increased to require more consistent movement
+        self.DECAY_RATE = 0.3                   # Slower decay
+        self.MIN_SPEAKING_DURATION = 1.0        # Minimum speaking duration
+        self.HEAD_MOVEMENT_THRESHOLD = 0.015    # Threshold for head movement detection
+        self.HEAD_MOVEMENT_FACTOR = 10          # Factor to reduce lip movement during head motion
+        self.ANOMALY_THRESHOLD = 2.5            # Threshold for detecting anomalous movements
         
         # Face tracking system
         self.face_histories = {}
@@ -47,61 +40,48 @@ class MediaPipeLipDetector:
         
         # Frame counter
         self.frame_count = 0
+        
+        # Debug flag
+        self.debug = False
     
     def get_faces_and_lips(self, image):
-        # Use InsightFace for robust face detection
-        faces = self.app.get(image)
-        
-        if not faces:
-            return []
-        
-        # Process with MediaPipe for lip landmarks
+        # Process with MediaPipe for face detection and lip landmarks
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         mp_results = self.mp_face_mesh.process(rgb_image)
         
         current_faces = []
         
-        # For each InsightFace detection
-        for i, face in enumerate(faces):
-            bbox = face.bbox  # [x1, y1, x2, y2, score]
-            
-            # For close-up shots, use MediaPipe if available
-            if mp_results and mp_results.multi_face_landmarks:
-                # Find closest MediaPipe face
-                best_mp_face = None
-                best_distance = float('inf')
+        if mp_results and mp_results.multi_face_landmarks:
+            for i, face_landmarks in enumerate(mp_results.multi_face_landmarks):
+                # Get face bounding box
+                landmarks = face_landmarks.landmark
+                h, w = image.shape[:2]
                 
-                face_center_x = (bbox[0] + bbox[2]) / 2
-                face_center_y = (bbox[1] + bbox[3]) / 2
+                # Extract face bounding box using landmarks
+                x_coordinates = [landmark.x * w for landmark in landmarks]
+                y_coordinates = [landmark.y * h for landmark in landmarks]
+                x1, y1 = int(min(x_coordinates)), int(min(y_coordinates))
+                x2, y2 = int(max(x_coordinates)), int(max(y_coordinates))
                 
-                for j, mp_face in enumerate(mp_results.multi_face_landmarks):
-                    # Calculate MediaPipe face center
-                    mp_x = np.mean([lm.x for lm in mp_face.landmark]) * image.shape[1]
-                    mp_y = np.mean([lm.y for lm in mp_face.landmark]) * image.shape[0]
-                    
-                    # Calculate distance
-                    distance = np.sqrt((face_center_x - mp_x)**2 + (face_center_y - mp_y)**2)
-                    
-                    if distance < best_distance:
-                        best_distance = distance
-                        best_mp_face = mp_face
+                # Add padding to the bounding box
+                padding_x = int((x2 - x1) * 0.05)
+                padding_y = int((y2 - y1) * 0.05)
+                x1 = max(0, x1 - padding_x)
+                y1 = max(0, y1 - padding_y)
+                x2 = min(w, x2 + padding_x)
+                y2 = min(h, y2 + padding_y)
                 
-                # If we found a matching MediaPipe face and it's close enough
-                if best_mp_face and best_distance < (bbox[2] - bbox[0]) * 0.5:
-                    # Calculate lip height using MediaPipe landmarks
-                    lip_height = self.calculate_lip_height_mediapipe(best_mp_face, image.shape)
-                    
-                    # Store detection
-                    current_faces.append({
-                        'id': i,
-                        'height': lip_height,
-                        'bbox': bbox,
-                        'mp_landmarks': best_mp_face,
-                    })
-                    continue
-            
-            # If MediaPipe failed, skip this face
-            # We're only using MediaPipe for lip detection in this simplified version
+                # Calculate lip height using MediaPipe landmarks
+                lip_height = self.calculate_lip_height_mediapipe(face_landmarks, image.shape)
+                
+                # Store detection
+                current_faces.append({
+                    'id': i,
+                    'height': lip_height,
+                    'bbox': [x1, y1, x2, y2, 1.0],  # [x1, y1, x2, y2, confidence]
+                    'mp_landmarks': face_landmarks,
+                    'face_size': (x2 - x1) * (y2 - y1),  # Add face size info
+                })
         
         # Assign display IDs
         for face in current_faces:
@@ -164,13 +144,56 @@ class MediaPipeLipDetector:
                     'is_speaking': False,
                     'speaking_frames_count': 0,
                     'display_id': display_id,
-                    'speaking_start_time': current_time
+                    'speaking_start_time': current_time,
+                    'head_position': deque(maxlen=5),  # Add head position tracking
+                    'last_variation': deque(maxlen=10),  # Add variation history
+                    'face_size': face_data.get('face_size', 0.0),  # Store face size
+                    'consecutive_moving_frames': 0,  # Track consecutive frames with movement
+                    'consecutive_still_frames': 0,   # Track consecutive frames without movement
+                    'speaking_confidence': 0.0       # Add confidence score
                 }
             else:
                 # Update display ID in history
                 self.face_histories[face_id]['display_id'] = display_id
+                # Update face size
+                self.face_histories[face_id]['face_size'] = face_data.get('face_size', 0.0)
             
             face_history = self.face_histories[face_id]
+            
+            # Get MediaPipe landmarks
+            mp_landmarks = face_data.get('mp_landmarks')
+            
+            if mp_landmarks:
+                # Track head position to filter out head movement
+                nose_x = mp_landmarks.landmark[1].x
+                nose_y = mp_landmarks.landmark[1].y
+                face_history['head_position'].append((nose_x, nose_y))
+                
+                # Calculate head movement
+                head_movement = 0
+                if len(face_history['head_position']) >= 3:
+                    positions = list(face_history['head_position'])
+                    head_movement = np.mean([
+                        np.sqrt((positions[i][0] - positions[i-1][0])**2 + 
+                                (positions[i][1] - positions[i-1][1])**2)
+                        for i in range(1, len(positions))
+                    ])
+                
+                # Check face orientation - be more lenient with profile views
+                is_profile_view = False
+                if len(mp_landmarks.landmark) > 0:
+                    # Check horizontal face orientation using ear and nose landmarks
+                    left_ear = mp_landmarks.landmark[234]  # Left ear landmark
+                    right_ear = mp_landmarks.landmark[454]  # Right ear landmark
+                    nose = mp_landmarks.landmark[1]  # Nose tip landmark
+                    
+                    # If one ear is much more visible than the other, it's likely a profile view
+                    ear_diff = abs(left_ear.z - right_ear.z)
+                    if ear_diff > 0.1:  # Significant depth difference between ears
+                        is_profile_view = True
+            else:
+                head_movement = 0
+                is_profile_view = False
             
             # Use lip height for speaking detection
             lip_height = face_data.get('height', 0.0)
@@ -180,23 +203,88 @@ class MediaPipeLipDetector:
                 recent_heights = list(face_history['last_heights'])[-5:]
                 variation = np.std(recent_heights)
                 
-                is_moving = variation > self.MOVEMENT_THRESHOLD
+                # Track recent variations
+                face_history['last_variation'].append(variation)
+                
+                # Detect anomalies in variation (sudden spikes)
+                is_anomaly = False
+                if len(face_history['last_variation']) >= 5:
+                    avg_variation = np.mean(list(face_history['last_variation'])[:-1])
+                    if variation > avg_variation * self.ANOMALY_THRESHOLD:
+                        is_anomaly = True
+                
+                # Adjust variation based on head movement
+                adjusted_variation = variation
+                if head_movement > self.HEAD_MOVEMENT_THRESHOLD:
+                    adjusted_variation = max(0, variation - (head_movement - self.HEAD_MOVEMENT_THRESHOLD) * self.HEAD_MOVEMENT_FACTOR)
+                
+                # Ignore anomalies
+                if is_anomaly:
+                    adjusted_variation = 0
+                
+                is_moving = adjusted_variation > self.MOVEMENT_THRESHOLD
                 is_open = lip_height > self.SILENCE_THRESHOLD
                 
+                # Update consecutive frame counters
                 if is_moving and is_open:
-                    face_history['speaking_frames_count'] += 2
+                    face_history['consecutive_moving_frames'] += 1
+                    face_history['consecutive_still_frames'] = 0
+                else:
+                    face_history['consecutive_moving_frames'] = 0
+                    face_history['consecutive_still_frames'] += 1
+                
+                # Require at least 3 consecutive frames of movement to consider it real
+                real_movement = face_history['consecutive_moving_frames'] >= 3
+                
+                # Debug info
+                if self.debug and self.frame_count % 30 == 0:
+                    print(f"\nFace {display_id} Debug Info:")
+                    print(f"Lip Height: {lip_height:.3f} (Threshold: {self.SILENCE_THRESHOLD})")
+                    print(f"Movement Variation: {variation:.3f} (Adjusted: {adjusted_variation:.3f})")
+                    print(f"Head Movement: {head_movement:.5f} (Threshold: {self.HEAD_MOVEMENT_THRESHOLD})")
+                    print(f"Is Anomaly: {is_anomaly}")
+                    print(f"Moving: {is_moving}, Open: {is_open}, Real Movement: {real_movement}")
+                    print(f"Speaking Frames Count: {face_history['speaking_frames_count']}")
+                    print(f"Speaking Confidence: {face_history['speaking_confidence']:.2f}")
+                    print(f"Currently Speaking: {face_history['is_speaking']}")
+                
+                # Calculate profile adjustment
+                profile_bonus = 0.02 if is_profile_view else 0.0
+                
+                if real_movement:
+                    # Apply profile bonus to increase speaking confidence more quickly for profile views
+                    confidence_boost = 0.15 + profile_bonus
+                    face_history['speaking_frames_count'] += 1.5
+                    face_history['speaking_confidence'] = min(1.0, face_history['speaking_confidence'] + confidence_boost)
+                    
                     if face_history['speaking_frames_count'] >= self.SPEAKING_FRAMES_THRESHOLD:
-                        if not face_history['is_speaking']:
+                        if not face_history['is_speaking'] and face_history['speaking_confidence'] > 0.6:
                             # Just started speaking - record the time
                             face_history['speaking_start_time'] = current_time
                         face_history['last_speaking_time'] = current_time
                         face_history['is_speaking'] = True
                 else:
+                    # Slower decay when not moving
                     face_history['speaking_frames_count'] = max(0, face_history['speaking_frames_count'] - self.DECAY_RATE)
-                    # Only transition to silent if minimum speaking duration has passed
+                    
+                    # Gradually reduce confidence
+                    confidence_decay = 0.05
+                    if head_movement > self.HEAD_MOVEMENT_THRESHOLD * 2:
+                        # Reduce confidence decay during significant head movement
+                        confidence_decay = 0.02
+                    
+                    # Be more lenient with profile views
+                    if is_profile_view:
+                        confidence_decay = max(0.01, confidence_decay - 0.02)
+                        
+                    face_history['speaking_confidence'] = max(0.0, face_history['speaking_confidence'] - confidence_decay)
+                    
+                    # Only transition to silent if confidence is low enough and we've met other criteria
                     if (face_history['is_speaking'] and 
                         current_time - face_history['speaking_start_time'] > self.MIN_SPEAKING_DURATION and
-                        current_time - face_history['last_speaking_time'] > self.SILENCE_DURATION):
+                        current_time - face_history['last_speaking_time'] > self.SILENCE_DURATION and
+                        face_history['consecutive_still_frames'] > 20 and
+                        face_history['speaking_confidence'] < 0.3):
                         face_history['is_speaking'] = False
             
             # Draw debug visualization
@@ -252,7 +340,8 @@ class MediaPipeLipDetector:
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         
         # Draw lip landmarks if MediaPipe landmarks are available
-        if face_data['mp_landmarks'] is not None:
+        mp_landmarks = face_data.get('mp_landmarks')
+        if mp_landmarks is not None:
             # Draw MediaPipe landmarks
             lip_indices = self.UPPER_LIP_INDICES + self.LOWER_LIP_INDICES
             
@@ -260,7 +349,7 @@ class MediaPipeLipDetector:
             dot_size = 2
             
             for idx in lip_indices:
-                landmark = face_data['mp_landmarks'].landmark[idx]
+                landmark = mp_landmarks.landmark[idx]
                 x = int(landmark.x * frame.shape[1])
                 y = int(landmark.y * frame.shape[0])
                 cv2.circle(frame, (x, y), dot_size, color, -1)
