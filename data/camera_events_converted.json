@@ -1,0 +1,14 @@
+{
+  "events": [
+    {
+      "time": 0,
+      "active_camera": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "message": "All cameras active - Starting detection"
+    }
+  ]
+}

@@ -6,6 +6,19 @@ import time
 
 class MediaPipeLipDetector:
     def __init__(self):
+        # Tell TensorFlow to use GPU if available (helps MediaPipe)
+        try:
+            import tensorflow as tf
+            gpus = tf.config.experimental.list_physical_devices('GPU')
+            if gpus:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                print(f"TensorFlow using GPU: {gpus}")
+            else:
+                print("No GPU found, using CPU")
+        except Exception as e:
+            print(f"Error configuring TensorFlow GPU: {e}")
+        
         # Initialize MediaPipe for face detection and lip tracking
         self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
@@ -328,16 +341,16 @@ class MediaPipeLipDetector:
         bbox = face_data['bbox']
         x1, y1, x2, y2 = map(int, bbox[:4])
         
-        # Draw face ID text above the face
-        face_id_text = f"Face {display_id}"
-        cv2.putText(frame, face_id_text, (x1, y1 - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
         # Color based on speaking status
         color = (0, 255, 0) if is_speaking else (0, 0, 255)
         
         # Draw face bounding box
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        
+        # Add speaking status text
+        status_text = "Speaking" if is_speaking else "Silent"
+        cv2.putText(frame, status_text, (x1, y1 - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
         # Draw lip landmarks if MediaPipe landmarks are available
         mp_landmarks = face_data.get('mp_landmarks')
