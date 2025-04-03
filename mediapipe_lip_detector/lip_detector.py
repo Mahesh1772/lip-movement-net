@@ -34,14 +34,16 @@ class MediaPipeLipDetector:
         
         # Parameters for speaking detection
         self.SILENCE_THRESHOLD = 0.04           # Threshold for open mouth
-        self.MOVEMENT_THRESHOLD = 0.01          # Increased to reduce false positives
-        self.SILENCE_DURATION = 2.5             # Increased silence duration
-        self.SPEAKING_FRAMES_THRESHOLD = 6      # Increased to require more consistent movement
+        self.MOVEMENT_THRESHOLD = 0.01          # Threshold for general lip movement
+        self.LOOKING_DOWN_THRESHOLD = 0.007     # Lower threshold for when looking down
+        self.SILENCE_DURATION = 2.5             # Silence duration
+        self.SPEAKING_FRAMES_THRESHOLD = 6      # Required consistent movement frames
         self.DECAY_RATE = 0.3                   # Slower decay
         self.MIN_SPEAKING_DURATION = 1.0        # Minimum speaking duration
         self.HEAD_MOVEMENT_THRESHOLD = 0.015    # Threshold for head movement detection
         self.HEAD_MOVEMENT_FACTOR = 10          # Factor to reduce lip movement during head motion
         self.ANOMALY_THRESHOLD = 2.5            # Threshold for detecting anomalous movements
+        self.LOOKING_DOWN_ANGLE = 30            # Threshold angle in degrees for looking down
         
         # Face tracking system
         self.face_histories = {}
@@ -163,7 +165,8 @@ class MediaPipeLipDetector:
                     'face_size': face_data.get('face_size', 0.0),  # Store face size
                     'consecutive_moving_frames': 0,  # Track consecutive frames with movement
                     'consecutive_still_frames': 0,   # Track consecutive frames without movement
-                    'speaking_confidence': 0.0       # Add confidence score
+                    'speaking_confidence': 0.0,       # Add confidence score
+                    'is_looking_down': False
                 }
             else:
                 # Update display ID in history
@@ -175,6 +178,10 @@ class MediaPipeLipDetector:
             
             # Get MediaPipe landmarks
             mp_landmarks = face_data.get('mp_landmarks')
+            
+            # Variables to track head orientation
+            is_profile_view = False
+            is_looking_down = False
             
             if mp_landmarks:
                 # Track head position to filter out head movement
@@ -192,8 +199,7 @@ class MediaPipeLipDetector:
                         for i in range(1, len(positions))
                     ])
                 
-                # Check face orientation - be more lenient with profile views
-                is_profile_view = False
+                # Check face orientation - detect profile views
                 if len(mp_landmarks.landmark) > 0:
                     # Check horizontal face orientation using ear and nose landmarks
                     left_ear = mp_landmarks.landmark[234]  # Left ear landmark
@@ -204,9 +210,37 @@ class MediaPipeLipDetector:
                     ear_diff = abs(left_ear.z - right_ear.z)
                     if ear_diff > 0.1:  # Significant depth difference between ears
                         is_profile_view = True
+                    
+                    # Detect looking down by comparing eye and chin position
+                    # When looking down, the eyes will be lower relative to the chin
+                    left_eye = mp_landmarks.landmark[33]  # Left eye
+                    right_eye = mp_landmarks.landmark[263]  # Right eye
+                    chin = mp_landmarks.landmark[152]  # Chin
+                    
+                    # Calculate the angle between the eye-nose line and horizontal
+                    eye_y = (left_eye.y + right_eye.y) / 2.0
+                    eye_x = (left_eye.x + right_eye.x) / 2.0
+                    
+                    # Vector from eyes to chin
+                    eye_to_chin_x = chin.x - eye_x
+                    eye_to_chin_y = chin.y - eye_y
+                    
+                    # Calculate angle in degrees (0 is horizontal, positive is looking down)
+                    # We're mainly interested in the vertical angle
+                    angle = np.degrees(np.arctan2(eye_to_chin_y, max(abs(eye_to_chin_x), 0.001)))
+                    
+                    # Alternative detection: check if nose is visibly below eyes
+                    nose_below_eyes = nose.y > eye_y + 0.02
+                    
+                    # Consider looking down if angle is large enough
+                    is_looking_down = angle > self.LOOKING_DOWN_ANGLE or nose_below_eyes
+                    
+                    # Store the looking down status in face history
+                    face_history['is_looking_down'] = is_looking_down
             else:
                 head_movement = 0
                 is_profile_view = False
+                is_looking_down = False
             
             # Use lip height for speaking detection
             lip_height = face_data.get('height', 0.0)
@@ -235,7 +269,13 @@ class MediaPipeLipDetector:
                 if is_anomaly:
                     adjusted_variation = 0
                 
-                is_moving = adjusted_variation > self.MOVEMENT_THRESHOLD
+                # Select the appropriate threshold based on head orientation
+                movement_threshold = self.MOVEMENT_THRESHOLD
+                if is_looking_down:
+                    # Use a lower threshold when looking down
+                    movement_threshold = self.LOOKING_DOWN_THRESHOLD
+                
+                is_moving = adjusted_variation > movement_threshold
                 is_open = lip_height > self.SILENCE_THRESHOLD
                 
                 # Update consecutive frame counters
@@ -255,6 +295,7 @@ class MediaPipeLipDetector:
                     print(f"Lip Height: {lip_height:.3f} (Threshold: {self.SILENCE_THRESHOLD})")
                     print(f"Movement Variation: {variation:.3f} (Adjusted: {adjusted_variation:.3f})")
                     print(f"Head Movement: {head_movement:.5f} (Threshold: {self.HEAD_MOVEMENT_THRESHOLD})")
+                    print(f"Is Looking Down: {is_looking_down} (Using threshold: {movement_threshold:.5f})")
                     print(f"Is Anomaly: {is_anomaly}")
                     print(f"Moving: {is_moving}, Open: {is_open}, Real Movement: {real_movement}")
                     print(f"Speaking Frames Count: {face_history['speaking_frames_count']}")
@@ -263,10 +304,11 @@ class MediaPipeLipDetector:
                 
                 # Calculate profile adjustment
                 profile_bonus = 0.02 if is_profile_view else 0.0
+                looking_down_bonus = 0.01 if is_looking_down else 0.0
                 
                 if real_movement:
-                    # Apply profile bonus to increase speaking confidence more quickly for profile views
-                    confidence_boost = 0.15 + profile_bonus
+                    # Apply profile and looking down bonuses to increase speaking confidence
+                    confidence_boost = 0.15 + profile_bonus + looking_down_bonus
                     face_history['speaking_frames_count'] += 1.5
                     face_history['speaking_confidence'] = min(1.0, face_history['speaking_confidence'] + confidence_boost)
                     
@@ -347,8 +389,16 @@ class MediaPipeLipDetector:
         # Draw face bounding box
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         
-        # Add speaking status text
+        # Get looking down status if available
+        is_looking_down = False
+        if face_data['id'] in self.face_histories:
+            is_looking_down = self.face_histories[face_data['id']].get('is_looking_down', False)
+        
+        # Add speaking status text and looking down indicator
         status_text = "Speaking" if is_speaking else "Silent"
+        if is_looking_down:
+            status_text += " (↓)"  # Add down arrow to indicate looking down
+        
         cv2.putText(frame, status_text, (x1, y1 - 10), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
