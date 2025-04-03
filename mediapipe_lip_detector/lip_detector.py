@@ -125,6 +125,17 @@ class MediaPipeLipDetector:
         faces_data = self.get_faces_and_lips(frame)
         current_time = time.time()
         
+        # If no faces detected, immediately mark all existing faces as not speaking
+        if not faces_data:
+            # Mark all existing face histories as not speaking
+            for face_id in self.face_histories:
+                self.face_histories[face_id]['is_speaking'] = False
+                self.face_histories[face_id]['speaking_confidence'] = 0.0
+                self.face_histories[face_id]['speaking_frames_count'] = 0
+            
+            # Return the frame unchanged with no speaking faces
+            return frame, {}
+        
         # Get current face IDs in this frame
         current_face_ids = {face_data['id'] for face_data in faces_data}
         
