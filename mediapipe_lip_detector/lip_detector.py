@@ -24,8 +24,8 @@ class MediaPipeLipDetector:
             static_image_mode=False,
             max_num_faces=8,
             refine_landmarks=True,
-            min_detection_confidence=0.3,  # Lower detection confidence
-            min_tracking_confidence=0.3    # Lower tracking confidence
+            min_detection_confidence=0.6,  # Increased from 0.3 to 0.6
+            min_tracking_confidence=0.5    # Increased from 0.3 to 0.5
         )
         
         # MediaPipe lip indices
